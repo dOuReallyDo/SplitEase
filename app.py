@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SplitEase v1.1.0 — Weekend Expense Splitter
+SplitEase v1.2.0 — Weekend Expense Splitter
 Mobile-first web app for splitting expenses with friends.
 Auto-auth via nickname cookie, shareable group links.
 Receipt photo upload with background removal.
@@ -121,6 +121,21 @@ def calc_settlements(group_id):
 def fmt_eur(v):
     s = f"{v:,.2f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+import shutil
+def backup_db():
+    """Create a timestamped backup of the DB before any write operation."""
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = os.path.join(BASE_DIR, 'backups')
+    os.makedirs(backup_dir, exist_ok=True)
+    dst = os.path.join(backup_dir, f'splitwise_{ts}.db')
+    shutil.copy2(DB_PATH, dst)
+    # Keep only the last 20 backups
+    backups = sorted([f for f in os.listdir(backup_dir) if f.endswith('.db')])
+    for old in backups[:-20]:
+        os.remove(os.path.join(backup_dir, old))
+    return dst
 
 def remove_receipt_bg(input_path, output_path):
     """Remove background from receipt image using Pillow + numpy."""
@@ -260,6 +275,7 @@ def add_expense(group_id):
     except ValueError:
         return redirect(url_for('group_page', group_id=group_id))
     conn = get_db()
+    backup_db()
     expense_id = str(uuid.uuid4())[:8]
     conn.execute("INSERT INTO expenses (id, group_id, payer_id, amount, description) VALUES (?,?,?,?,?)",
                  (expense_id, group_id, payer_id, amount, description))
@@ -273,6 +289,7 @@ def delete_expense(group_id, expense_id):
     member = get_member_from_cookie(group_id)
     if not member:
         return redirect(url_for('group_page', group_id=group_id))
+    backup_db()
     conn = get_db()
     exp = conn.execute("SELECT receipt_path FROM expenses WHERE id=? AND group_id=?", (expense_id, group_id)).fetchone()
     if exp and exp['receipt_path']:
@@ -284,6 +301,74 @@ def delete_expense(group_id, expense_id):
     conn.commit()
     conn.close()
     return redirect(url_for('group_page', group_id=group_id))
+
+
+@app.route('/api/expense/<expense_id>', methods=['PATCH'])
+def update_expense(expense_id):
+    """Inline edit: update amount and/or description. Returns updated balances."""
+    member = get_member_from_cookie(request.args.get('gid', ''))
+    if not member:
+        data = request.get_json(force=True) if request.is_json else {}
+        group_id = data.get('group_id', '')
+        member = get_member_from_cookie(group_id)
+    if not member:
+        return jsonify({"error": "not authenticated"}), 401
+
+    data = request.get_json(force=True)
+    group_id = data.get('group_id', '')
+
+    conn = get_db()
+    exp = conn.execute("SELECT * FROM expenses WHERE id=? AND group_id=?", (expense_id, group_id)).fetchone()
+    if not exp:
+        conn.close()
+        return jsonify({"error": "expense not found"}), 404
+
+    # Backup before modification
+    backup_db()
+
+    updates = {}
+    if 'amount' in data:
+        try:
+            amount = float(data['amount'])
+            if amount <= 0:
+                return jsonify({"error": "amount must be positive"}), 400
+            updates['amount'] = amount
+        except (ValueError, TypeError):
+            return jsonify({"error": "invalid amount"}), 400
+    if 'description' in data:
+        desc = data['description'].strip()
+        if desc:
+            updates['description'] = desc
+
+    if updates:
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [expense_id, group_id]
+        conn.execute(f"UPDATE expenses SET {set_clause} WHERE id=? AND group_id=?", values)
+        conn.commit()
+
+    # Recalculate and return
+    expenses = conn.execute("SELECT e.*, m.nickname as payer_name FROM expenses e JOIN members m ON e.payer_id=m.id WHERE e.group_id=? ORDER BY e.created_at DESC", (group_id,)).fetchall()
+    members = conn.execute("SELECT * FROM members WHERE group_id=?", (group_id,)).fetchall()
+    conn.close()
+
+    balances = calc_balances(group_id)
+    settlements = calc_settlements(group_id)
+    total = sum(e['amount'] for e in expenses)
+    per_person = total / len(members) if members else 0
+
+    return jsonify({
+        "ok": True,
+        "total": fmt_eur(total),
+        "per_person": fmt_eur(per_person),
+        "n_members": len(members),
+        "n_expenses": len(expenses),
+        "balances": {mid: {"nickname": info["nickname"], "paid": fmt_eur(info["paid"]), "share": fmt_eur(info["share"]), "balance": fmt_eur(info["balance"]),
+                           "balance_raw": info["balance"], "color": "green" if info["balance"] > 0.01 else ("red" if info["balance"] < -0.01 else "neutral"),
+                           "label": f"Riceve € {fmt_eur(info['balance'])}" if info["balance"] > 0.01 else (f"Deve dare € {fmt_eur(abs(info['balance']))}" if info["balance"] < -0.01 else "Pari ✅"),
+                           "emoji": "📥" if info["balance"] > 0.01 else ("📤" if info["balance"] < -0.01 else "🤝")
+                          } for mid, info in balances.items()},
+        "settlements": [{"from": s[0], "to": s[1], "amount": fmt_eur(s[2])} for s in settlements],
+    })
 
 
 @app.route('/g/<group_id>/receipt/<expense_id>', methods=['POST'])
@@ -435,19 +520,25 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 .settle-arrow{color:var(--text3);font-size:20px}
 .settle-to{flex:1;font-weight:700;color:var(--green-text);font-size:17px;text-align:right}
 /* Expenses */
-.expense-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 46px 14px 16px; margin-bottom: 10px; position: relative; }
+.expense-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px; position: relative; }
 .expense-desc { font-weight: 600; font-size: 17px; }
 .expense-info { flex: 1; min-width: 0; }
 .expense-meta-row { display: flex; align-items: baseline; gap: 8px; margin-top: 2px; }
 .expense-payer { font-size: 14px; color: var(--text2); }
 .expense-time { font-size: 12px; color: var(--text3); }
-.expense-amount { font-weight: 800; font-size: 20px; color: var(--green-text); min-width: 75px; text-align: right; white-space: nowrap; }
+.expense-amount { font-weight: 800; font-size: 20px; color: var(--green-text); white-space: nowrap; cursor: pointer; padding: 2px 6px; border-radius: 6px; transition: background .15s; }
+.expense-amount:hover { background: var(--green-bg); }
+.expense-amount.editing { background: var(--bg3); outline: none; min-width: 60px; }
+.amount-edit-input { font-weight: 800; font-size: 20px; color: var(--green-text); background: var(--bg3); border: 2px solid var(--accent); border-radius: 6px; padding: 2px 6px; width: 90px; text-align: right; outline: none; }
+.desc-edit-input { font-weight: 600; font-size: 17px; color: var(--text); background: var(--bg3); border: 2px solid var(--accent); border-radius: 6px; padding: 2px 8px; outline: none; width: 100%; }
 .expense-row { display: flex; align-items: center; gap: 12px; }
+.expense-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 
 /* Receipt */
-.receipt-btn { flex-shrink:0; background: none; border: none; font-size: 18px; cursor: pointer; padding: 6px; border-radius: 8px; transition: all .15s; color: var(--text3); line-height: 1; }
-.receipt-btn:hover { background: var(--bg3); color: var(--accent); }
-.receipt-btn.has-photo { color: var(--accent); }
+.receipt-box { flex-shrink: 0; }
+.receipt-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; font-size: 15px; cursor: pointer; padding: 6px 8px; transition: all .15s; color: var(--text3); line-height: 1; }
+.receipt-btn:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.receipt-btn.has-photo { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .receipt-modal img{max-width:90vw;max-height:70vh;border-radius:12px;object-fit:contain}
 .receipt-modal-actions{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap;justify-content:center}
 .receipt-modal-btn{padding:12px 24px;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;border:none;color:#fff}
@@ -665,15 +756,19 @@ APP_TEMPLATE = """<!DOCTYPE html>
         </form>
         {% endif %}
         <div class="expense-row">
-          <button class="receipt-btn{% if e.receipt_path %} has-photo{% endif %}" onclick="openReceipt('{{ e.id }}', {{ 'true' if e.receipt_path else 'false' }})" title="Scontrino">📎</button>
           <div class="expense-info">
-            <div class="expense-desc">{{ e.description }}</div>
+            <div class="expense-desc" id="desc-{{ e.id }}" {% if member and e.payer_id == member.id %}onclick="editDesc('{{ e.id }}', '{{ e.description|e }}')"{% endif %} {% if member and e.payer_id == member.id %}style="cursor:pointer;border-radius:4px;padding:0 4px;transition:background .15s;" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background='transparent'"{% endif %}>{{ e.description }}</div>
             <div class="expense-meta-row">
               <span class="expense-payer">👤 {{ e.payer_name }}</span>
               <span class="expense-time">{{ e.created_at[:16].replace('T', ' ') }}</span>
             </div>
           </div>
-          <div class="expense-amount">€ {{ fmt(e.amount) }}</div>
+          <div class="expense-right">
+            <span class="expense-amount" id="amt-{{ e.id }}" {% if member and e.payer_id == member.id %}onclick="editAmount('{{ e.id }}', {{ e.amount }})"{% endif %}>€ {{ fmt(e.amount) }}</span>
+            <div class="receipt-box">
+              <button class="receipt-btn{% if e.receipt_path %} has-photo{% endif %}" onclick="openReceipt('{{ e.id }}', {{ 'true' if e.receipt_path else 'false' }})" title="Scontrino">📎</button>
+            </div>
+          </div>
         </div>
       </div>
       {% endfor %}
@@ -771,7 +866,40 @@ async function deleteReceipt(){
   }catch(err){showToast('Errore di connessione');}
 }
 
-function showToast(msg){const t=document.getElementById('toast');t.textContent=msg||'Link copiato! ✅';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);}
+function showToast(msg){const t=document.getElementById('toast');t.textContent=msg||'✅';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);}
+
+// ── Inline editing ──
+function editAmount(eid, currentVal){
+  const el=document.getElementById('amt-'+eid);
+  if(el.querySelector('input'))return; // already editing
+  const raw=currentVal.toFixed(2).replace('.',',');
+  el.innerHTML='<input type="number" class="amount-edit-input" value="'+currentVal.toFixed(2)+'" step="0.01" min="0.01" id="amtEdit-'+eid+'">';
+  const inp=document.getElementById('amtEdit-'+eid);
+  inp.focus();inp.select();
+  const save=async()=>{
+    const v=parseFloat(inp.value);
+    if(isNaN(v)||v<=0){el.innerHTML='€ '+raw;return;}
+    try{const r=await fetch('/api/expense/'+eid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_id:GROUP_ID,amount:v})});
+    const d=await r.json();if(d.ok){location.reload();}else{showToast('Errore: '+(d.error||'salvataggio fallito'));el.innerHTML='€ '+raw;}}catch(e){showToast('Errore di connessione');el.innerHTML='€ '+raw;}
+  };
+  inp.addEventListener('blur',save);
+  inp.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();inp.blur();}if(e.key==='Escape'){el.innerHTML='€ '+raw;}});
+}
+function editDesc(eid, currentDesc){
+  const el=document.getElementById('desc-'+eid);
+  if(el.querySelector('input'))return;
+  el.innerHTML='<input type="text" class="desc-edit-input" value="'+currentDesc.replace(/"/g,'&quot;')+'" maxlength="100" id="descEdit-'+eid+'">';
+  const inp=document.getElementById('descEdit-'+eid);
+  inp.focus();inp.select();
+  const save=async()=>{
+    const v=inp.value.trim();
+    if(!v){el.textContent=currentDesc;return;}
+    try{const r=await fetch('/api/expense/'+eid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_id:GROUP_ID,description:v})});
+    const d=await r.json();if(d.ok){location.reload();}else{showToast('Errore: '+(d.error||'salvataggio fallito'));el.textContent=currentDesc;}}catch(e){showToast('Errore di connessione');el.textContent=currentDesc;}
+  };
+  inp.addEventListener('blur',save);
+  inp.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();inp.blur();}if(e.key==='Escape'){el.textContent=currentDesc;}});
+}
 function copyLink(){const url='{{ share_url }}';if(navigator.clipboard){navigator.clipboard.writeText(url).then(()=>showToast('Link copiato! ✅')).catch(()=>fallbackCopy(url));}else{fallbackCopy(url);}}
 function fallbackCopy(url){const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');showToast('Link copiato! ✅');}catch(e){}document.body.removeChild(ta);}
 function shareLink(){const url='{{ share_url }}',text='💸 Unisciti a "{{ group_name }}" su SplitEase per dividere le spese!';if(navigator.share){navigator.share({title:'SplitEase — {{ group_name }}',text:text,url:url}).catch(()=>copyLink());}else{copyLink();}}

@@ -2,26 +2,22 @@
 
 > Dividi le spese con chi vuoi 💸
 
-**v1.0.0**
-
-Mobile-first web app per dividere le spese durante vacanze e weekend con amici. Zero login, zero friction — crei il gruppo, condividi il link, tutti inseriscono le spese.
-
-## Features
+**v1.1.0**
 
 - 🔗 **Link sharing** — crea il gruppo e condividi il link via WhatsApp/Telegram/iMessage
 - ⚡ **Zero registrazione** — autenticazione automatica via cookie nickname
 - 💰 **Inserimento spese** — descrizione + importo + chi ha pagato
 - 📊 **Saldi immediati** — chi deve dare, chi deve ricevere, aggiornati in tempo reale
+- 📈 **Totale e per persona** — somma totale e quota ciascuno sotto la lista spese
 - 🔄 **Settlement ottimizzato** — algoritmo di minimizzazione delle transazioni
+- 📎 **Scontrini** — allega o scatta foto dello scontrino per ogni spesa, rimozione automatica sfondo
 - 🌗 **Light/Dark mode** — switch con persistenza via localStorage
 - 📱 **Mobile-first** — pensato per l'uso dal telefonino al ristorante
-- ✕ **Cancellazione spese** — chi ha pagato può cancellare le proprie
-- 📤 **Web Share API** — condivisione Instagram-style su smartphone
 
 ## Stack
 
 - **Backend**: Python 3 + Flask
-- **Database**: SQLite (WAL mode)
+- **Database**: SQLite (WAL mode) + Pillow/numpy per elaborazione immagini
 - **Frontend**: HTML + CSS variables + vanilla JS (Jinja2 template)
 - **Deploy**: Cloudflare Tunnel
 
@@ -58,4 +54,4 @@ README.md
 
 ## Versione
 
-**v1.0.0** — Prima release stabile
+**v1.1.0** — Aggiunti scontrini con rimozione sfondo, totale per persona, migliorato layout spese

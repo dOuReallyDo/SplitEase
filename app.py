@@ -434,19 +434,20 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 .settle-from{flex:1;font-weight:700;color:var(--red-text);font-size:17px}
 .settle-arrow{color:var(--text3);font-size:20px}
 .settle-to{flex:1;font-weight:700;color:var(--green-text);font-size:17px;text-align:right}
-.settle-amount{font-weight:800;color:var(--text);font-size:17px;background:var(--bg3);border-radius:20px;padding:5px 14px;white-space:nowrap}
-.expense-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px 46px 16px 18px;margin-bottom:10px;position:relative}
-.expense-desc{font-weight:600;font-size:17px}
-.expense-meta{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
-.expense-payer{font-size:14px;color:var(--text2)}
-.expense-time{font-size:12px;color:var(--text3)}
-.expense-amount{font-weight:800;font-size:20px;color:var(--green-text);min-width:75px;text-align:right}
-.expense-row{display:flex;align-items:center;gap:14px}
-.receipt-btn{position:absolute;left:12px;bottom:10px;background:none;border:none;font-size:18px;cursor:pointer;padding:4px 6px;border-radius:8px;transition:all .15s;color:var(--text3)}
-.receipt-btn:hover{background:var(--bg3);color:var(--accent)}
-.receipt-btn.has-photo{color:var(--accent)}
-.receipt-modal{display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.85);align-items:center;justify-content:center;flex-direction:column;padding:20px}
-.receipt-modal.active{display:flex}
+/* Expenses */
+.expense-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 46px 14px 16px; margin-bottom: 10px; position: relative; }
+.expense-desc { font-weight: 600; font-size: 17px; }
+.expense-info { flex: 1; min-width: 0; }
+.expense-meta-row { display: flex; align-items: baseline; gap: 8px; margin-top: 2px; }
+.expense-payer { font-size: 14px; color: var(--text2); }
+.expense-time { font-size: 12px; color: var(--text3); }
+.expense-amount { font-weight: 800; font-size: 20px; color: var(--green-text); min-width: 75px; text-align: right; white-space: nowrap; }
+.expense-row { display: flex; align-items: center; gap: 12px; }
+
+/* Receipt */
+.receipt-btn { flex-shrink:0; background: none; border: none; font-size: 18px; cursor: pointer; padding: 6px; border-radius: 8px; transition: all .15s; color: var(--text3); line-height: 1; }
+.receipt-btn:hover { background: var(--bg3); color: var(--accent); }
+.receipt-btn.has-photo { color: var(--accent); }
 .receipt-modal img{max-width:90vw;max-height:70vh;border-radius:12px;object-fit:contain}
 .receipt-modal-actions{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap;justify-content:center}
 .receipt-modal-btn{padding:12px 24px;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;border:none;color:#fff}
@@ -663,12 +664,14 @@ APP_TEMPLATE = """<!DOCTYPE html>
           <button type="submit" class="del-btn" title="Cancella">✕</button>
         </form>
         {% endif %}
-        <button class="receipt-btn{% if e.receipt_path %} has-photo{% endif %}" onclick="openReceipt('{{ e.id }}', {{ 'true' if e.receipt_path else 'false' }})" title="Scontrino">📎</button>
         <div class="expense-row">
-          <div style="flex:1">
+          <button class="receipt-btn{% if e.receipt_path %} has-photo{% endif %}" onclick="openReceipt('{{ e.id }}', {{ 'true' if e.receipt_path else 'false' }})" title="Scontrino">📎</button>
+          <div class="expense-info">
             <div class="expense-desc">{{ e.description }}</div>
-            <span class="expense-payer">👤 {{ e.payer_name }}</span>
-            <span class="expense-time">{{ e.created_at[:16].replace('T', ' ') }}</span>
+            <div class="expense-meta-row">
+              <span class="expense-payer">👤 {{ e.payer_name }}</span>
+              <span class="expense-time">{{ e.created_at[:16].replace('T', ' ') }}</span>
+            </div>
           </div>
           <div class="expense-amount">€ {{ fmt(e.amount) }}</div>
         </div>

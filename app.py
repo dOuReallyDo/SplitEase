@@ -439,6 +439,28 @@ def serve_receipt(filename):
     return send_file(os.path.join(UPLOAD_DIR, filename))
 
 
+# ─── PWA STATIC FILES ─────────────────────────────────────────────────────────
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_file(os.path.join(BASE_DIR, 'static', filename))
+
+
+@app.route('/sw.js')
+def serve_sw():
+    resp = make_response(send_file(os.path.join(BASE_DIR, 'static', 'sw.js')))
+    resp.headers['Service-Worker-Allowed'] = '/'
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.route('/manifest.json')
+def serve_manifest():
+    resp = make_response(send_file(os.path.join(BASE_DIR, 'static', 'manifest.json')))
+    resp.headers['Content-Type'] = 'application/manifest+json'
+    return resp
+
+
 @app.route('/api/create', methods=['POST'])
 def api_create():
     data = request.get_json() or {}
@@ -584,6 +606,16 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>SplitEase</title>
+<meta name="description" content="Dividi le spese con chi vuoi — crea gruppi, aggiungi spese, calcola saldi automaticamente.">
+<meta name="theme-color" content="#ea580c">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="SplitEase">
+<meta name="mobile-web-app-capable" content="yes">
 <script>const t=localStorage.getItem('se_theme')||'light';document.documentElement.setAttribute('data-theme',t);</script>
 """ + THEME_CSS_FULL + """
 </head>
@@ -626,6 +658,7 @@ function toggleTheme(){const h=document.documentElement,m=localStorage.getItem('
 function updateBtn(){const d=document.documentElement.getAttribute('data-theme');document.getElementById('themeBtn1').textContent=d==='dark'?'☀️ Light':'🌙 Dark';const b=document.getElementById('themeBtn2');if(b)b.textContent=d==='dark'?'☀️ Light':'🌙 Dark';}
 updateBtn();
 document.getElementById('createForm').addEventListener('submit',async(e)=>{e.preventDefault();const b={group_name:document.getElementById('groupName').value.trim(),nickname:document.getElementById('nickName').value.trim(),description:document.getElementById('firstDesc').value.trim(),amount:document.getElementById('firstAmount').value||0};if(!b.group_name||!b.nickname)return;const btn=e.target.querySelector('button[type=submit]');btn.disabled=true;btn.textContent='Creazione...';try{const r=await fetch('/api/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const d=await r.json();document.cookie='se_token='+d.token+';path=/;max-age='+(365*86400)+';SameSite=Lax';window.location.href=d.url;}catch(err){btn.disabled=false;btn.textContent='Crea gruppo e inizia →';alert('Errore, riprova');}});
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
 </script>
 </body>
 </html>"""
@@ -636,6 +669,16 @@ APP_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>SplitEase — {{ group_name }}</title>
+<meta name="description" content="Dividi le spese con chi vuoi — crea gruppi, aggiungi spese, calcola saldi automaticamente.">
+<meta name="theme-color" content="#ea580c">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="SplitEase">
+<meta name="mobile-web-app-capable" content="yes">
 <script>const t=localStorage.getItem('se_theme')||'light';document.documentElement.setAttribute('data-theme',t);</script>
 """ + THEME_CSS_FULL + """
 </head>
@@ -903,6 +946,7 @@ function editDesc(eid, currentDesc){
 function copyLink(){const url='{{ share_url }}';if(navigator.clipboard){navigator.clipboard.writeText(url).then(()=>showToast('Link copiato! ✅')).catch(()=>fallbackCopy(url));}else{fallbackCopy(url);}}
 function fallbackCopy(url){const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');showToast('Link copiato! ✅');}catch(e){}document.body.removeChild(ta);}
 function shareLink(){const url='{{ share_url }}',text='💸 Unisciti a "{{ group_name }}" su SplitEase per dividere le spese!';if(navigator.share){navigator.share({title:'SplitEase — {{ group_name }}',text:text,url:url}).catch(()=>copyLink());}else{copyLink();}}
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
 </script>
 </body>
 </html>"""

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-SplitEase v2.0.0 — Weekend Expense Splitter
+SplitEase v2.1.0 — Weekend Expense Splitter
 Mobile-first web app for splitting expenses with friends.
 Multi-group dashboard + user identity + link sharing.
 Receipt photo upload with background removal.
+Weighted expense splitting with per-member shares.
 """
 
 import os
+import json
 import uuid
 import sqlite3
 from flask import (Flask, request, redirect, url_for, jsonify,
@@ -72,6 +74,20 @@ def init_db():
             conn.execute("ALTER TABLE members ADD COLUMN user_token TEXT")
     except Exception:
         pass
+    # M2: add shares column to expenses table (JSON-encoded dict, NULL = equal split)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(expenses)").fetchall()]
+        if 'shares' not in cols:
+            conn.execute("ALTER TABLE expenses ADD COLUMN shares TEXT DEFAULT NULL")
+    except Exception:
+        pass
+    # M2: add default_shares column to groups table (JSON-encoded dict, NULL = equal split)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(groups)").fetchall()]
+        if 'default_shares' not in cols:
+            conn.execute("ALTER TABLE groups ADD COLUMN default_shares TEXT DEFAULT NULL")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -133,18 +149,45 @@ def calc_balances(group_id):
         return {}
     n = len(members)
     paid = {m['id']: 0.0 for m in members}
+    owed = {m['id']: 0.0 for m in members}  # how much each member owes (their share)
     for e in expenses:
         if e['payer_id'] in paid:
             paid[e['payer_id']] += e['amount']
-    total = sum(e['amount'] for e in expenses)
-    share = total / n if n > 0 else 0
+        # Calculate shares for this expense
+        shares_raw = e['shares'] if 'shares' in e.keys() else None
+        if shares_raw:
+            try:
+                shares_dict = json.loads(shares_raw)
+                total_weight = sum(float(w) for w in shares_dict.values() if w)
+                if total_weight > 0:
+                    for mid_key, weight in shares_dict.items():
+                        try:
+                            w = float(weight)
+                            if w > 0 and mid_key in owed:
+                                owed[mid_key] += e['amount'] * (w / total_weight)
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    # All-zero weights fallback to equal split
+                    share = e['amount'] / n if n > 0 else 0
+                    for m in members:
+                        owed[m['id']] += share
+            except (json.JSONDecodeError, TypeError):
+                share = e['amount'] / n if n > 0 else 0
+                for m in members:
+                    owed[m['id']] += share
+        else:
+            # Equal split (default)
+            share = e['amount'] / n if n > 0 else 0
+            for m in members:
+                owed[m['id']] += share
     balances = {}
     for m in members:
-        b = round(paid[m['id']] - share, 2)
+        b = round(paid[m['id']] - owed[m['id']], 2)
         balances[m['id']] = {
             'nickname': m['nickname'],
             'paid': round(paid[m['id']], 2),
-            'share': round(share, 2),
+            'share': round(owed[m['id']], 2),
             'balance': b,
         }
     return balances
@@ -285,6 +328,43 @@ def group_page(group_id):
     # Check if user has dashboard access
     user_token, user = get_or_create_user()
 
+    # M2: get default_shares for the group (JSON dict or None)
+    default_shares_raw = g['default_shares'] if 'default_shares' in g.keys() else None
+    default_shares = None
+    if default_shares_raw:
+        try:
+            default_shares = json.loads(default_shares_raw)
+        except (json.JSONDecodeError, TypeError):
+            default_shares = None
+
+    # Build a dict of member_id -> nickname for the template
+    members_json = [{'id': m['id'], 'nickname': m['nickname']} for m in members]
+
+    # Build share info for each expense: "📊 4:3:6:1" or "🤝 Equo"
+    expense_shares_info = {}
+    for e in expenses:
+        e_shares_raw = e['shares'] if 'shares' in e.keys() else None
+        if e_shares_raw:
+            try:
+                e_shares = json.loads(e_shares_raw)
+                # Build display string: "4:3:6:1" ordered by member order
+                parts = []
+                for m in members:
+                    w = e_shares.get(m['id'])
+                    if w is not None:
+                        try:
+                            parts.append(str(int(float(w))) if float(w) == int(float(w)) else str(float(w)))
+                        except (ValueError, TypeError):
+                            pass
+                if parts:
+                    expense_shares_info[e['id']] = '📊 ' + ':'.join(parts)
+                else:
+                    expense_shares_info[e['id']] = '🤝 Equo'
+            except (json.JSONDecodeError, TypeError):
+                expense_shares_info[e['id']] = '🤝 Equo'
+        else:
+            expense_shares_info[e['id']] = '🤝 Equo'
+
     return render_template_string(APP_TEMPLATE,
         group_name=g['name'],
         group_id=group_id,
@@ -293,13 +373,18 @@ def group_page(group_id):
         n_members=len(members),
         n_expenses=len(expenses),
         members=members,
+        members_json=members_json,
         member=member,
         balances=balances,
         settlements=settlements,
         expenses=expenses,
+        expense_shares_info=expense_shares_info,
         share_url=share_url,
         fmt=fmt_eur,
         has_dashboard=bool(user_token),
+        default_shares=default_shares,
+        default_shares_json=json.dumps(default_shares) if default_shares else 'null',
+        members_json_str=json.dumps(members_json),
     )
 
 
@@ -349,11 +434,46 @@ def add_expense(group_id):
         if amount <= 0: raise ValueError
     except ValueError:
         return redirect(url_for('group_page', group_id=group_id))
+
+    # M2: handle split mode
+    split_mode = request.form.get('split_mode', 'equal')
+    shares_json = None
+    if split_mode == 'weighted':
+        # Collect shares_<member_id> fields
+        conn = get_db()
+        members = conn.execute("SELECT id FROM members WHERE group_id=?", (group_id,)).fetchall()
+        conn.close()
+        shares_dict = {}
+        for m in members:
+            field_name = f"shares_{m['id']}"
+            val = request.form.get(field_name, '').strip()
+            if val:
+                try:
+                    w = float(val)
+                    if w > 0:
+                        shares_dict[m['id']] = w
+                except (ValueError, TypeError):
+                    pass
+        if shares_dict and sum(shares_dict.values()) > 0:
+            shares_json = json.dumps(shares_dict)
+
+        # Save as default if requested
+        save_default = request.form.get('save_default')
+        if save_default and shares_json:
+            conn = get_db()
+            conn.execute("UPDATE groups SET default_shares=? WHERE id=?", (shares_json, group_id))
+            conn.commit()
+            conn.close()
+
     conn = get_db()
     backup_db()
     expense_id = str(uuid.uuid4())[:8]
-    conn.execute("INSERT INTO expenses (id, group_id, payer_id, amount, description) VALUES (?,?,?,?,?)",
-                 (expense_id, group_id, payer_id, amount, description))
+    if shares_json:
+        conn.execute("INSERT INTO expenses (id, group_id, payer_id, amount, description, shares) VALUES (?,?,?,?,?,?)",
+                     (expense_id, group_id, payer_id, amount, description, shares_json))
+    else:
+        conn.execute("INSERT INTO expenses (id, group_id, payer_id, amount, description) VALUES (?,?,?,?,?)",
+                     (expense_id, group_id, payer_id, amount, description))
     conn.commit()
     conn.close()
     return redirect(url_for('group_page', group_id=group_id))
@@ -414,6 +534,22 @@ def update_expense(expense_id):
         desc = data['description'].strip()
         if desc:
             updates['description'] = desc
+
+    # M2: handle shares update
+    if 'shares' in data:
+        shares_val = data['shares']
+        if shares_val is None:
+            updates['shares'] = None
+        elif isinstance(shares_val, dict):
+            # Validate and store as JSON
+            try:
+                cleaned = {k: float(v) for k, v in shares_val.items() if v}
+                if cleaned and sum(cleaned.values()) > 0:
+                    updates['shares'] = json.dumps(cleaned)
+                else:
+                    updates['shares'] = None
+            except (ValueError, TypeError):
+                return jsonify({"error": "invalid shares"}), 400
 
     if updates:
         set_clause = ", ".join(f"{k}=?" for k in updates)
@@ -512,6 +648,19 @@ def delete_receipt(group_id, expense_id):
 @app.route('/receipts/<path:filename>')
 def serve_receipt(filename):
     return send_file(os.path.join(UPLOAD_DIR, filename))
+
+
+# M2: Reset default shares for a group
+@app.route('/api/group/<group_id>/reset-default-shares', methods=['POST'])
+def reset_default_shares(group_id):
+    member = get_member_from_cookie(group_id)
+    if not member:
+        return jsonify({"error": "not authenticated"}), 401
+    conn = get_db()
+    conn.execute("UPDATE groups SET default_shares=NULL WHERE id=?", (group_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
 
 
 # ─── PWA STATIC FILES ─────────────────────────────────────────────────────────
@@ -735,6 +884,22 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .dash-back-link{display:inline-flex;align-items:center;gap:4px;color:var(--text2);text-decoration:none;font-size:15px;font-weight:600;margin-bottom:10px;transition:color .15s}
 .dash-back-link:hover{color:var(--accent)}
+/* M2: Shares section */
+.split-section{margin-top:12px}
+.split-toggle-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.split-toggle{background:var(--bg3);color:var(--text2);border:1px solid var(--border);border-radius:20px;padding:5px 14px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s}
+.split-toggle.active{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.split-reset-link{font-size:13px;color:var(--text3);text-decoration:underline;cursor:pointer;margin-left:auto}
+.split-reset-link:hover{color:var(--red)}
+.shares-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;margin-bottom:8px}
+.share-input-wrap{display:flex;flex-direction:column;align-items:center;gap:2px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:6px 4px}
+.share-input-wrap label{font-size:12px;color:var(--text2);font-weight:600;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px}
+.share-input-wrap input{width:60px;text-align:center;padding:6px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:16px;font-weight:700;outline:none}
+.share-input-wrap input:focus{border-color:var(--accent)}
+.save-default-row{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text2)}
+.save-default-row input{width:auto}
+.expense-split-badge{font-size:13px;font-weight:700;color:var(--text3);background:var(--bg3);border-radius:8px;padding:2px 8px;white-space:nowrap}
+.expense-split-badge.weighted{color:var(--accent);background:var(--accent-soft)}
 </style>"""
 
 # ─── TEMPLATES ────────────────────────────────────────────────────────────────
@@ -847,7 +1012,7 @@ APP_TEMPLATE = """<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Aggiungi spesa</div>
     <div class="card">
-      <form method="POST" action="/g/{{ group_id }}/expense">
+      <form method="POST" action="/g/{{ group_id }}/expense" id="expenseForm">
         <div class="form-row">
           <input type="text" name="description" placeholder="Cosa hai pagato? (es. cena, benzina...)" required class="input-desc" maxlength="100">
         </div>
@@ -861,6 +1026,31 @@ APP_TEMPLATE = """<!DOCTYPE html>
             <option value="{{ m.id }}"{% if m.id == member.id %} selected{% endif %}>{{ m.nickname }}</option>
             {% endfor %}
           </select>
+        </div>
+        <!-- M2: Shares section -->
+        <input type="hidden" name="split_mode" id="splitMode" value="{{ 'weighted' if default_shares else 'equal' }}">
+        <div class="split-section">
+          <div class="split-toggle-row">
+            <button type="button" class="split-toggle {{ 'active' if default_shares else '' }}" id="splitToggle" onclick="toggleSplitMode()">
+              {{ '👥 Quote' if default_shares else '🤝 Equo' }}
+            </button>
+            {% if default_shares %}
+            <span class="split-reset-link" onclick="resetDefaultShares()">Reset default</span>
+            {% endif %}
+          </div>
+          <div id="sharesGrid" class="shares-grid" style="{{ '' if default_shares else 'display:none' }}">
+            {% for m in members %}
+            <div class="share-input-wrap">
+              <label>{{ m.nickname }}</label>
+              {% set sv = default_shares.get(m.id, 1) if default_shares else 1 %}
+              <input type="number" name="shares_{{ m.id }}" id="shares_{{ m.id }}" step="0.01" min="0" value="{{ sv }}" placeholder="1">
+            </div>
+            {% endfor %}
+          </div>
+          <div class="save-default-row" id="saveDefaultRow" style="{{ '' if default_shares else 'display:none' }}">
+            <input type="checkbox" name="save_default" id="saveDefault" value="1" checked>
+            <label for="saveDefault">Salva come default per le prossime spese</label>
+          </div>
         </div>
         <button type="submit" class="btn-primary">Aggiungi spesa 💰</button>
       </form>
@@ -953,6 +1143,9 @@ APP_TEMPLATE = """<!DOCTYPE html>
           </div>
           <div class="expense-right">
             <span class="expense-amount" id="amt-{{ e.id }}" {% if member and e.payer_id == member.id %}onclick="editAmount('{{ e.id }}', {{ e.amount }})"{% endif %}>€ {{ fmt(e.amount) }}</span>
+            {% if expense_shares_info and expense_shares_info.get(e.id) %}
+            <span class="expense-split-badge{% if '📊' in expense_shares_info.get(e.id, '') %} weighted{% endif %}">{{ expense_shares_info.get(e.id) }}</span>
+            {% endif %}
             <div class="receipt-box">
               <button class="receipt-btn{% if e.receipt_path %} has-photo{% endif %}" onclick="openReceipt('{{ e.id }}', {{ 'true' if e.receipt_path else 'false' }})" title="Scontrino">📎</button>
             </div>
@@ -1016,6 +1209,67 @@ APP_TEMPLATE = """<!DOCTYPE html>
 <script>
 const GROUP_ID='{{ group_id }}';
 let currentExpenseId=null,hasReceipt=false;
+const DEFAULT_SHARES={{ default_shares_json|safe }};
+const MEMBERS={{ members_json_str|safe }};
+
+// M2: Toggle between equal and weighted split modes
+function toggleSplitMode() {
+  const toggle = document.getElementById('splitToggle');
+  const grid = document.getElementById('sharesGrid');
+  const saveRow = document.getElementById('saveDefaultRow');
+  const modeInput = document.getElementById('splitMode');
+  const isWeighted = toggle.textContent.includes('Quote');
+  if (isWeighted) {
+    // Switch to Equal
+    toggle.textContent = '🤝 Equo';
+    toggle.classList.remove('active');
+    grid.style.display = 'none';
+    saveRow.style.display = 'none';
+    modeInput.value = 'equal';
+  } else {
+    // Switch to Weighted
+    toggle.textContent = '👥 Quote';
+    toggle.classList.add('active');
+    grid.style.display = '';
+    saveRow.style.display = '';
+    modeInput.value = 'weighted';
+    // If no default shares, fill with 1 for all
+    if (!DEFAULT_SHARES) {
+      MEMBERS.forEach(function(m) {
+        const inp = document.getElementById('shares_' + m.id);
+        if (inp && !inp.value) inp.value = 1;
+      });
+    }
+  }
+}
+
+// M2: Reset default shares via API
+async function resetDefaultShares() {
+  if (!confirm('Azzerare le quote predefinite? Le prossime spese useranno la divisione equa.')) return;
+  try {
+    const res = await fetch('/api/group/' + GROUP_ID + '/reset-default-shares', {method: 'POST'});
+    const data = await res.json();
+    if (data.ok) {
+      showToast('Quote default azzerate');
+      // Switch to equal mode visually
+      const toggle = document.getElementById('splitToggle');
+      const grid = document.getElementById('sharesGrid');
+      const saveRow = document.getElementById('saveDefaultRow');
+      const modeInput = document.getElementById('splitMode');
+      const resetLink = document.querySelector('.split-reset-link');
+      toggle.textContent = '🤝 Equo';
+      toggle.classList.remove('active');
+      grid.style.display = 'none';
+      saveRow.style.display = 'none';
+      modeInput.value = 'equal';
+      if (resetLink) resetLink.style.display = 'none';
+    } else {
+      showToast('Errore: ' + (data.error || 'operazione fallita'));
+    }
+  } catch (e) {
+    showToast('Errore di connessione');
+  }
+}
 
 function toggleTheme(){const h=document.documentElement,m=localStorage.getItem('se_theme')||'light',n=m==='light'?'dark':'light';h.setAttribute('data-theme',n);localStorage.setItem('se_theme',n);updateBtn();}
 function updateBtn(){const d=document.documentElement.getAttribute('data-theme');const b=document.getElementById('themeBtn2');if(b)b.textContent=d==='dark'?'☀️ Light':'🌙 Dark';}

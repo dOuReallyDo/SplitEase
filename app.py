@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-SplitEase v1.2.0 — Weekend Expense Splitter
+SplitEase v2.0.0 — Weekend Expense Splitter
 Mobile-first web app for splitting expenses with friends.
-Auto-auth via nickname cookie, shareable group links.
+Multi-group dashboard + user identity + link sharing.
 Receipt photo upload with background removal.
 """
 
@@ -43,6 +43,7 @@ def init_db():
             group_id TEXT NOT NULL,
             nickname TEXT NOT NULL,
             token TEXT UNIQUE NOT NULL,
+            user_token TEXT,
             created_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
             UNIQUE(group_id, nickname)
@@ -58,11 +59,42 @@ def init_db():
             FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
             FOREIGN KEY (payer_id) REFERENCES members(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS users (
+            token TEXT PRIMARY KEY,
+            nickname TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
     """)
+    # Migration-safe ALTER: add user_token column to existing members table
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(members)").fetchall()]
+        if 'user_token' not in cols:
+            conn.execute("ALTER TABLE members ADD COLUMN user_token TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def get_or_create_user():
+    """Get user from se_user cookie, or return (None, None). Does NOT create."""
+    user_token = request.cookies.get('se_user')
+    if not user_token:
+        return None, None
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE token=?", (user_token,)).fetchone()
+    conn.close()
+    return (user_token, dict(user) if user else None)
+
+def create_user(nickname=None):
+    """Create a new user, return (token, nickname)."""
+    token = str(uuid.uuid4())
+    conn = get_db()
+    conn.execute("INSERT INTO users (token, nickname) VALUES (?,?)", (token, nickname))
+    conn.commit()
+    conn.close()
+    return token, nickname
 
 def get_member_from_cookie(group_id):
     token = request.cookies.get('se_token')
@@ -72,6 +104,25 @@ def get_member_from_cookie(group_id):
     m = conn.execute("SELECT * FROM members WHERE token=? AND group_id=?", (token, group_id)).fetchone()
     conn.close()
     return dict(m) if m else None
+
+def get_user_groups(user_token):
+    """Return list of dicts with group info for a user token."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT g.id, g.name, g.created_at,
+                  (SELECT COUNT(*) FROM members WHERE group_id=g.id) as n_members,
+                  (SELECT COUNT(*) FROM expenses WHERE group_id=g.id) as n_expenses,
+                  (SELECT COALESCE(SUM(amount),0) FROM expenses WHERE group_id=g.id) as total_amount,
+                  (SELECT MAX(created_at) FROM expenses WHERE group_id=g.id) as last_activity,
+                  m.nickname as my_nickname
+           FROM groups g
+           JOIN members m ON m.group_id = g.id
+           WHERE m.user_token = ?
+           ORDER BY g.created_at DESC""",
+        (user_token,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 def calc_balances(group_id):
     conn = get_db()
@@ -194,7 +245,19 @@ def remove_receipt_bg(input_path, output_path):
 
 @app.route('/')
 def index():
-    return render_template_string(INDEX_HTML)
+    user_token, user = get_or_create_user()
+    user_nick = user['nickname'] if user else ''
+    return render_template_string(INDEX_HTML, user_nick=user_nick, has_user=bool(user))
+
+
+@app.route('/dashboard')
+def dashboard():
+    user_token, user = get_or_create_user()
+    if not user_token:
+        return redirect(url_for('index'))
+    groups = get_user_groups(user_token)
+    nickname = user['nickname'] if user else 'Utente'
+    return render_template_string(DASHBOARD_HTML, groups=groups, nickname=nickname, fmt=fmt_eur)
 
 
 @app.route('/g/<group_id>', methods=['GET'])
@@ -219,6 +282,9 @@ def group_page(group_id):
     per_person = total / len(members) if members else 0
     share_url = request.host_url.rstrip('/') + '/g/' + group_id
 
+    # Check if user has dashboard access
+    user_token, user = get_or_create_user()
+
     return render_template_string(APP_TEMPLATE,
         group_name=g['name'],
         group_id=group_id,
@@ -233,6 +299,7 @@ def group_page(group_id):
         expenses=expenses,
         share_url=share_url,
         fmt=fmt_eur,
+        has_dashboard=bool(user_token),
     )
 
 
@@ -241,21 +308,29 @@ def join_group(group_id):
     nickname = request.form.get('nickname', '').strip()
     if not nickname:
         return redirect(url_for('group_page', group_id=group_id))
+
+    user_token, user = get_or_create_user()
+    if not user_token:
+        # Create user if not exists
+        user_token, _ = create_user(nickname)
+
     conn = get_db()
     existing = conn.execute("SELECT id FROM members WHERE group_id=? AND nickname=?",
                             (group_id, nickname)).fetchone()
     if existing:
         token = str(uuid.uuid4())
-        conn.execute("UPDATE members SET token=? WHERE id=?", (token, existing['id']))
+        conn.execute("UPDATE members SET token=?, user_token=? WHERE id=?",
+                     (token, user_token, existing['id']))
     else:
         token = str(uuid.uuid4())
         member_id = str(uuid.uuid4())[:8]
-        conn.execute("INSERT INTO members (id, group_id, nickname, token) VALUES (?,?,?,?)",
-                     (member_id, group_id, nickname, token))
+        conn.execute("INSERT INTO members (id, group_id, nickname, token, user_token) VALUES (?,?,?,?,?)",
+                     (member_id, group_id, nickname, token, user_token))
     conn.commit()
     conn.close()
     resp = redirect(url_for('group_page', group_id=group_id))
     resp.set_cookie('se_token', token, max_age=365*24*3600, httponly=True, samesite='Lax')
+    resp.set_cookie('se_user', user_token, max_age=365*24*3600, httponly=True, samesite='Lax')
     return resp
 
 
@@ -470,13 +545,19 @@ def api_create():
     first_amount = data.get('amount', 0)
     if not group_name or not nickname:
         return jsonify({"error": "group_name and nickname required"}), 400
+
+    # Get or create user
+    user_token, user = get_or_create_user()
+    if not user_token:
+        user_token, _ = create_user(nickname)
+
     group_id = str(uuid.uuid4())[:10]
     member_id = str(uuid.uuid4())[:8]
     token = str(uuid.uuid4())
     conn = get_db()
     conn.execute("INSERT INTO groups (id, name) VALUES (?,?)", (group_id, group_name))
-    conn.execute("INSERT INTO members (id, group_id, nickname, token) VALUES (?,?,?,?)",
-                 (member_id, group_id, nickname, token))
+    conn.execute("INSERT INTO members (id, group_id, nickname, token, user_token) VALUES (?,?,?,?,?)",
+                 (member_id, group_id, nickname, token, user_token))
     if first_desc and first_amount:
         try:
             first_amount = float(first_amount)
@@ -488,7 +569,31 @@ def api_create():
             pass
     conn.commit()
     conn.close()
-    return jsonify({"group_id": group_id, "token": token, "url": f"/g/{group_id}"})
+    return jsonify({"group_id": group_id, "token": token, "user_token": user_token, "url": "/dashboard"})
+
+
+@app.route('/api/my-groups')
+def my_groups():
+    """JSON endpoint returning the current user's groups."""
+    user_token, user = get_or_create_user()
+    if not user_token:
+        return jsonify({"error": "not authenticated"}), 401
+    groups = get_user_groups(user_token)
+    return jsonify({
+        "groups": [
+            {
+                "id": g["id"],
+                "name": g["name"],
+                "n_members": g["n_members"],
+                "n_expenses": g["n_expenses"],
+                "total": round(g["total_amount"], 2),
+                "total_fmt": fmt_eur(g["total_amount"]),
+                "last_activity": g["last_activity"],
+                "my_nickname": g["my_nickname"],
+            }
+            for g in groups
+        ]
+    })
 
 
 # ─── SHARED STYLE ─────────────────────────────────────────────────────────────
@@ -541,6 +646,7 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 .settle-from{flex:1;font-weight:700;color:var(--red-text);font-size:17px}
 .settle-arrow{color:var(--text3);font-size:20px}
 .settle-to{flex:1;font-weight:700;color:var(--green-text);font-size:17px;text-align:right}
+.settle-amount{font-weight:700;color:var(--text)}
 /* Expenses */
 .expense-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px; position: relative; }
 .expense-desc { font-weight: 600; font-size: 17px; }
@@ -561,6 +667,8 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 .receipt-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; font-size: 15px; cursor: pointer; padding: 6px 8px; transition: all .15s; color: var(--text3); line-height: 1; }
 .receipt-btn:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 .receipt-btn.has-photo { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.receipt-modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:9999;flex-direction:column;padding:20px}
+.receipt-modal.active{display:flex}
 .receipt-modal img{max-width:90vw;max-height:70vh;border-radius:12px;object-fit:contain}
 .receipt-modal-actions{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap;justify-content:center}
 .receipt-modal-btn{padding:12px 24px;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;border:none;color:#fff}
@@ -596,6 +704,37 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 .index-box{max-width:420px;width:100%}
 .index-title{font-size:32px;text-align:center;margin-bottom:4px;font-weight:900;background:linear-gradient(135deg,var(--accent2),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .index-sub{text-align:center;color:var(--text2);margin-bottom:32px;font-size:18px}
+
+/* Dashboard styles */
+.dash-wrap{min-height:100vh}
+.dash-header{background:var(--bg2);border-bottom:2px solid var(--border);padding:20px 20px 16px}
+.dash-header h1{font-size:22px;font-weight:800;margin-bottom:4px}
+.dash-header .meta{color:var(--text2);font-size:15px;margin-bottom:14px}
+.dash-nick{display:inline-flex;align-items:center;gap:6px;background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent);border-radius:20px;padding:5px 14px;font-size:15px;font-weight:600}
+.dash-grid{display:grid;gap:14px;margin-top:16px}
+.dash-card{background:var(--bg2);border:2px solid var(--border);border-radius:var(--radius);padding:18px;transition:border-color .2s,box-shadow .2s;position:relative;text-decoration:none;color:inherit;display:block;animation:fadeIn .4s ease-out}
+.dash-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-soft)}
+.dash-card-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
+.dash-card-name{font-size:19px;font-weight:800;color:var(--text)}
+.dash-card-stats{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;font-size:14px;color:var(--text2)}
+.dash-stat{display:flex;align-items:center;gap:4px}
+.dash-stat strong{color:var(--text);font-weight:700}
+.dash-card-total{font-size:22px;font-weight:800;color:var(--accent);margin-bottom:4px}
+.dash-card-last{font-size:13px;color:var(--text3);margin-bottom:14px}
+.dash-card-actions{display:flex;gap:10px}
+.dash-btn{flex:1;padding:12px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;border:none;text-align:center;text-decoration:none;transition:opacity .15s}
+.dash-btn:active{opacity:.85}
+.dash-btn.open{background:var(--accent);color:#fff}
+.dash-btn.share{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}
+.dash-btn.share:hover{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.dash-create-btn{display:block;width:100%;padding:16px;background:var(--accent);border:none;border-radius:12px;color:#fff;font-size:17px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;margin-bottom:16px;transition:opacity .15s}
+.dash-create-btn:active{opacity:.85}
+.dash-empty{text-align:center;padding:40px 20px;color:var(--text3)}
+.dash-empty-icon{font-size:48px;margin-bottom:12px}
+.dash-empty-text{font-size:17px;margin-bottom:20px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.dash-back-link{display:inline-flex;align-items:center;gap:4px;color:var(--text2);text-decoration:none;font-size:15px;font-weight:600;margin-bottom:10px;transition:color .15s}
+.dash-back-link:hover{color:var(--accent)}
 </style>"""
 
 # ─── TEMPLATES ────────────────────────────────────────────────────────────────
@@ -627,6 +766,9 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
     <h1 class="index-title">SplitEase</h1>
     <p class="index-sub">Dividi le spese con chi vuoi 💸</p>
+    {% if has_user %}
+    <a href="/dashboard" class="dash-create-btn" style="margin-bottom:16px;display:block;width:100%;padding:16px;background:var(--bg3);border:1px solid var(--border);color:var(--accent);font-size:17px;font-weight:700;border-radius:12px;text-align:center;text-decoration:none;box-sizing:border-box">📋 I miei gruppi →</a>
+    {% endif %}
     <div class="card">
       <form id="createForm">
         <div class="form-row">
@@ -635,7 +777,7 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
         <div class="form-row">
           <label class="field-label">Il tuo nome</label>
-          <input type="text" id="nickName" placeholder="es. Mario" required maxlength="20" class="input-nick">
+          <input type="text" id="nickName" placeholder="es. Mario" required maxlength="20" class="input-nick" value="{{ user_nick }}">
         </div>
         <div style="color:var(--text3);text-align:center;font-size:15px;margin:18px 0 12px;font-weight:600">Prima spesa (opzionale)</div>
         <div class="form-row">
@@ -657,7 +799,7 @@ INDEX_HTML = """<!DOCTYPE html>
 function toggleTheme(){const h=document.documentElement,m=localStorage.getItem('se_theme')||'light',n=m==='light'?'dark':'light';h.setAttribute('data-theme',n);localStorage.setItem('se_theme',n);updateBtn();}
 function updateBtn(){const d=document.documentElement.getAttribute('data-theme');document.getElementById('themeBtn1').textContent=d==='dark'?'☀️ Light':'🌙 Dark';const b=document.getElementById('themeBtn2');if(b)b.textContent=d==='dark'?'☀️ Light':'🌙 Dark';}
 updateBtn();
-document.getElementById('createForm').addEventListener('submit',async(e)=>{e.preventDefault();const b={group_name:document.getElementById('groupName').value.trim(),nickname:document.getElementById('nickName').value.trim(),description:document.getElementById('firstDesc').value.trim(),amount:document.getElementById('firstAmount').value||0};if(!b.group_name||!b.nickname)return;const btn=e.target.querySelector('button[type=submit]');btn.disabled=true;btn.textContent='Creazione...';try{const r=await fetch('/api/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const d=await r.json();document.cookie='se_token='+d.token+';path=/;max-age='+(365*86400)+';SameSite=Lax';window.location.href=d.url;}catch(err){btn.disabled=false;btn.textContent='Crea gruppo e inizia →';alert('Errore, riprova');}});
+document.getElementById('createForm').addEventListener('submit',async(e)=>{e.preventDefault();const b={group_name:document.getElementById('groupName').value.trim(),nickname:document.getElementById('nickName').value.trim(),description:document.getElementById('firstDesc').value.trim(),amount:document.getElementById('firstAmount').value||0};if(!b.group_name||!b.nickname)return;const btn=e.target.querySelector('button[type=submit]');btn.disabled=true;btn.textContent='Creazione...';try{const r=await fetch('/api/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const d=await r.json();document.cookie='se_token='+d.token+';path=/;max-age='+(365*86400)+';SameSite=Lax';if(d.user_token){document.cookie='se_user='+d.user_token+';path=/;max-age='+(365*86400)+';SameSite=Lax';}window.location.href=d.url;}catch(err){btn.disabled=false;btn.textContent='Crea gruppo e inizia →';alert('Errore, riprova');}});
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
 </script>
 </body>
@@ -688,6 +830,9 @@ APP_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <div class="header">
+  {% if has_dashboard %}
+  <a href="/dashboard" class="dash-back-link" style="color:var(--text2);text-decoration:none;font-size:15px;font-weight:600;display:inline-block;margin-bottom:8px">← Dashboard</a>
+  {% endif %}
   <h1>💸 {{ group_name }}</h1>
   <div class="meta">{{ n_members }} persone · {{ n_expenses }} spese · Totale: € {{ total }}</div>
   <div class="members">
@@ -837,10 +982,18 @@ APP_TEMPLATE = """<!DOCTYPE html>
     <div class="section-title">Condividi il link 📱</div>
     <div class="share-box">
       <p style="color:var(--text2);font-size:16px;margin-bottom:8px">Invia questo link ai tuoi amici</p>
-      <button class="share-btn" onclick="shareLink()">🔗 Condividi link</button>
+      <button class="share-btn" onclick="shareLink()">🔗 Condividi link gruppo</button>
       <div class="share-link" onclick="copyLink()" id="shareUrl">{{ share_url }}</div>
       <p style="color:var(--text3);font-size:13px;margin-top:10px">Tocca per copiare · Condivisione Instagram-style</p>
     </div>
+  </div>
+
+  <!-- New group / Dashboard buttons -->
+  <div class="section">
+    {% if has_dashboard %}
+    <a href="/dashboard" class="btn-primary" style="display:block;text-decoration:none;text-align:center;margin-bottom:10px">📋 I miei gruppi</a>
+    {% endif %}
+    <a href="/" class="btn-primary" style="display:block;text-decoration:none;text-align:center;background:var(--bg3);color:var(--accent);border:1px solid var(--border)">➕ Crea nuovo gruppo</a>
   </div>
 </div>
 
@@ -951,9 +1104,112 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catc
 </body>
 </html>"""
 
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>SplitEase — Dashboard</title>
+<meta name="description" content="I tuoi gruppi SplitEase">
+<meta name="theme-color" content="#ea580c">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="SplitEase">
+<meta name="mobile-web-app-capable" content="yes">
+<script>const t=localStorage.getItem('se_theme')||'light';document.documentElement.setAttribute('data-theme',t);</script>
+""" + THEME_CSS_FULL + """
+</head>
+<body>
+<div class="theme-toggle">
+  <button class="theme-btn" onclick="toggleTheme()" id="themeBtn3"></button>
+</div>
+<div class="dash-wrap">
+  <div class="dash-header">
+    <a href="/" class="dash-back-link">← Home</a>
+    <h1>📋 I miei gruppi</h1>
+    <div class="meta">
+      <span class="dash-nick">👤 {{ nickname }}</span>
+    </div>
+  </div>
+  <div class="container">
+    <a href="/" class="dash-create-btn">➕ Crea nuovo gruppo</a>
+
+    {% if groups %}
+    <div class="dash-grid">
+      {% for g in groups %}
+      <div class="dash-card" style="animation-delay:{{ loop.index0 * 0.05 }}s">
+        <div class="dash-card-top">
+          <div class="dash-card-name">{{ g.name }}</div>
+        </div>
+        <div class="dash-card-stats">
+          <span class="dash-stat">👥 <strong>{{ g.n_members }}</strong></span>
+          <span class="dash-stat">💰 <strong>{{ g.n_expenses }}</strong> spese</span>
+        </div>
+        <div class="dash-card-total">€ {{ fmt(g.total_amount) }}</div>
+        {% if g.last_activity %}
+        <div class="dash-card-last">Ultima attività: {{ g.last_activity[:16].replace('T', ' ') }}</div>
+        {% else %}
+        <div class="dash-card-last">Nessuna spesa ancora</div>
+        {% endif %}
+        <div class="dash-card-actions">
+          <a href="/g/{{ g.id }}" class="dash-btn open">Apri →</a>
+          <button class="dash-btn share" onclick="shareGroup('{{ g.id }}','{{ g.name|e }}')">🔗 Condividi</button>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="dash-empty">
+      <div class="dash-empty-icon">📋</div>
+      <div class="dash-empty-text">Non sei ancora in nessun gruppo.<br>Crea il primo!</div>
+      <a href="/" class="btn-primary" style="display:block;text-decoration:none;text-align:center">➕ Crea nuovo gruppo</a>
+    </div>
+    {% endif %}
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+function toggleTheme(){const h=document.documentElement,m=localStorage.getItem('se_theme')||'light',n=m==='light'?'dark':'light';h.setAttribute('data-theme',n);localStorage.setItem('se_theme',n);updateBtn();}
+function updateBtn(){const d=document.documentElement.getAttribute('data-theme');const b=document.getElementById('themeBtn3');if(b)b.textContent=d==='dark'?'☀️ Light':'🌙 Dark';}
+updateBtn();
+
+function showToast(msg){const t=document.getElementById('toast');t.textContent=msg||'✅';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);}
+
+function shareGroup(gid, gname){
+  const url=window.location.origin+'/g/'+gid;
+  const text='💸 Unisciti a "'+gname+'" su SplitEase per dividere le spese!';
+  if(navigator.share){
+    navigator.share({title:'SplitEase — '+gname,text:text,url:url}).catch(()=>{
+      copyUrl(url);
+    });
+  }else{
+    copyUrl(url);
+  }
+}
+function copyUrl(url){
+  if(navigator.clipboard){
+    navigator.clipboard.writeText(url).then(()=>showToast('Link copiato! ✅')).catch(()=>fallbackCopy(url));
+  }else{
+    fallbackCopy(url);
+  }
+}
+function fallbackCopy(url){
+  const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy');showToast('Link copiato! ✅');}catch(e){}
+  document.body.removeChild(ta);
+}
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
+</script>
+</body>
+</html>"""
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get('PORT', 5555))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=True)

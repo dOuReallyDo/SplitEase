@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-SplitEase v2.1.0 — Weekend Expense Splitter
+SplitEase v2.2.0 — Weekend Expense Splitter
 Mobile-first web app for splitting expenses with friends.
 Multi-group dashboard + user identity + link sharing.
 Receipt photo upload with background removal.
 Weighted expense splitting with per-member shares.
+Settlement payments — record partial balance settlements between members.
 """
 
 import os
@@ -65,6 +66,18 @@ def init_db():
             token TEXT PRIMARY KEY,
             nickname TEXT,
             created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS settlements (
+            id TEXT PRIMARY KEY,
+            group_id TEXT NOT NULL,
+            from_id TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT DEFAULT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+            FOREIGN KEY (from_id) REFERENCES members(id) ON DELETE CASCADE,
+            FOREIGN KEY (to_id) REFERENCES members(id) ON DELETE CASCADE
         );
     """)
     # Migration-safe ALTER: add user_token column to existing members table
@@ -144,12 +157,15 @@ def calc_balances(group_id):
     conn = get_db()
     members = conn.execute("SELECT * FROM members WHERE group_id=?", (group_id,)).fetchall()
     expenses = conn.execute("SELECT * FROM expenses WHERE group_id=?", (group_id,)).fetchall()
+    settlements = conn.execute("SELECT * FROM settlements WHERE group_id=?", (group_id,)).fetchall()
     conn.close()
     if not members:
         return {}
     n = len(members)
     paid = {m['id']: 0.0 for m in members}
     owed = {m['id']: 0.0 for m in members}  # how much each member owes (their share)
+    s_paid = {m['id']: 0.0 for m in members}     # settlements_paid: money given to someone
+    s_recv = {m['id']: 0.0 for m in members}    # settlements_received: money received from someone
     for e in expenses:
         if e['payer_id'] in paid:
             paid[e['payer_id']] += e['amount']
@@ -181,9 +197,18 @@ def calc_balances(group_id):
             share = e['amount'] / n if n > 0 else 0
             for m in members:
                 owed[m['id']] += share
+    # M3: apply settlements to balances
+    for s in settlements:
+        fid = s['from_id']
+        tid = s['to_id']
+        amt = s['amount']
+        if fid in s_paid:
+            s_paid[fid] += amt   # gave money → reduces debt
+        if tid in s_recv:
+            s_recv[tid] += amt   # received money → reduces credit
     balances = {}
     for m in members:
-        b = round(paid[m['id']] - owed[m['id']], 2)
+        b = round(paid[m['id']] - owed[m['id']] + s_paid[m['id']] - s_recv[m['id']], 2)
         balances[m['id']] = {
             'nickname': m['nickname'],
             'paid': round(paid[m['id']], 2),
@@ -321,6 +346,7 @@ def group_page(group_id):
 
     balances = calc_balances(group_id)
     settlements = calc_settlements(group_id)
+    settlement_history = get_settlements_history(group_id)
     total = sum(e['amount'] for e in expenses)
     per_person = total / len(members) if members else 0
     share_url = request.host_url.rstrip('/') + '/g/' + group_id
@@ -382,6 +408,7 @@ def group_page(group_id):
         share_url=share_url,
         fmt=fmt_eur,
         has_dashboard=bool(user_token),
+        settlement_history=settlement_history,
         default_shares=default_shares,
         default_shares_json=json.dumps(default_shares) if default_shares else 'null',
         members_json_str=json.dumps(members_json),
@@ -663,6 +690,86 @@ def reset_default_shares(group_id):
     return jsonify({"ok": True})
 
 
+# ─── M3: SETTLEMENT PAYMENTS ───────────────────────────────────────────────────
+
+def get_settlements_history(group_id):
+    """Return recorded settlement payments for a group (most recent first)."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT s.*, mf.nickname as from_name, mt.nickname as to_name
+           FROM settlements s
+           JOIN members mf ON s.from_id = mf.id
+           JOIN members mt ON s.to_id = mt.id
+           WHERE s.group_id=?
+           ORDER BY s.created_at DESC""",
+        (group_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.route('/g/<group_id>/settle', methods=['POST'])
+def add_settlement(group_id):
+    """Record a settlement payment between two members."""
+    member = get_member_from_cookie(group_id)
+    if not member:
+        return redirect(url_for('group_page', group_id=group_id))
+
+    from_id = request.form.get('from_id', '').strip()
+    to_id = request.form.get('to_id', '').strip()
+    amount_str = request.form.get('amount', '').strip()
+    note = request.form.get('note', '').strip()
+
+    # Validate
+    if not from_id or not to_id or from_id == to_id:
+        return redirect(url_for('group_page', group_id=group_id))
+    try:
+        amount = float(amount_str)
+        if amount <= 0:
+            return redirect(url_for('group_page', group_id=group_id))
+    except (ValueError, TypeError):
+        return redirect(url_for('group_page', group_id=group_id))
+
+    conn = get_db()
+    # Validate both are members of the group
+    valid_ids = {m['id'] for m in conn.execute(
+        "SELECT id FROM members WHERE group_id=?", (group_id,)).fetchall()}
+    if from_id not in valid_ids or to_id not in valid_ids:
+        conn.close()
+        return redirect(url_for('group_page', group_id=group_id))
+
+    backup_db()
+    settlement_id = str(uuid.uuid4())[:8]
+    conn.execute(
+        "INSERT INTO settlements (id, group_id, from_id, to_id, amount, note) VALUES (?,?,?,?,?,?)",
+        (settlement_id, group_id, from_id, to_id, amount, note if note else None)
+    )
+    conn.commit()
+    conn.close()
+    return redirect(url_for('group_page', group_id=group_id))
+
+
+@app.route('/g/<group_id>/settle/<settlement_id>', methods=['POST'])
+def delete_settlement(group_id, settlement_id):
+    """Delete a settlement record (undo a payment). Supports POST for browser forms."""
+    member = get_member_from_cookie(group_id)
+    if not member:
+        return redirect(url_for('group_page', group_id=group_id))
+    conn = get_db()
+    s = conn.execute(
+        "SELECT * FROM settlements WHERE id=? AND group_id=?",
+        (settlement_id, group_id)).fetchone()
+    if not s:
+        conn.close()
+        return redirect(url_for('group_page', group_id=group_id))
+    backup_db()
+    conn.execute("DELETE FROM settlements WHERE id=? AND group_id=?",
+                 (settlement_id, group_id))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('group_page', group_id=group_id))
+
+
 # ─── PWA STATIC FILES ─────────────────────────────────────────────────────────
 
 @app.route('/static/<path:filename>')
@@ -900,6 +1007,20 @@ input,select,button,textarea{font-family:inherit;font-size:inherit}
 .save-default-row input{width:auto}
 .expense-split-badge{font-size:13px;font-weight:700;color:var(--text3);background:var(--bg3);border-radius:8px;padding:2px 8px;white-space:nowrap}
 .expense-split-badge.weighted{color:var(--accent);background:var(--accent-soft)}
+/* M3: Settlement payments */
+.settle-pay-row{display:flex;align-items:center;padding:14px 18px;background:var(--green-bg);border:1px solid var(--green);border-radius:var(--radius);margin-bottom:10px;gap:10px}
+.settle-pay-info{flex:1;min-width:0}
+.settle-pay-text{font-weight:600;font-size:16px;color:var(--text)}
+.settle-pay-note{font-size:13px;color:var(--green-text);margin-top:2px}
+.settle-pay-amount{font-weight:800;font-size:18px;color:var(--green-text);white-space:nowrap}
+.settle-pay-badge{font-size:12px;font-weight:700;color:var(--green-text);background:var(--green-bg);border:1px solid var(--green);border-radius:6px;padding:2px 8px;white-space:nowrap}
+.settle-pay-time{font-size:12px;color:var(--text3)}
+.settle-form-row-inline{display:flex;gap:10px;margin-bottom:14px}
+.input-settle-from,.input-settle-to{flex:1;padding:15px 14px;background:var(--bg3);border:2px solid var(--border);border-radius:12px;color:var(--text);font-size:16px;outline:none;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='%23888'%3E%3Cpath d='M7 10L2 5h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center}
+.input-settle-note{width:100%;padding:15px 18px;background:var(--bg3);border:2px solid var(--border);border-radius:12px;color:var(--text);font-size:17px;outline:none;transition:border .2s}
+.input-settle-note:focus{border-color:var(--accent)}
+.settle-arrow-mini{font-size:18px;color:var(--text3);align-self:center}
+.settle-settled-badge{display:inline-block;font-size:13px;font-weight:700;color:var(--green-text);background:var(--green-bg);border:1px solid var(--green);border-radius:8px;padding:3px 10px;margin-bottom:8px}
 </style>"""
 
 # ─── TEMPLATES ────────────────────────────────────────────────────────────────
@@ -1102,7 +1223,7 @@ APP_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Settlements -->
+  <!-- Settlements (remaining debts after recorded payments) -->
   {% if settlements %}
   <div class="section">
     <div class="section-title">Chi paga chi</div>
@@ -1118,8 +1239,69 @@ APP_TEMPLATE = """<!DOCTYPE html>
   {% elif balances %}
   <div class="section">
     <div class="section-title">Chi paga chi</div>
-    <div class="card empty">Tutti pari, nessun saldo da sistemare! 🎉</div>
+    <div class="card empty">Tutti pari! 🎉</div>
   </div>
+  {% endif %}
+
+  {% if member %}
+  <!-- M3: Record payment form -->
+  <div class="section">
+    <div class="section-title">Registra pagamento</div>
+    <div class="card">
+      <form method="POST" action="/g/{{ group_id }}/settle" id="settleForm">
+        <div class="settle-form-row-inline">
+          <select name="from_id" class="input-settle-from" id="settleFrom">
+            {% for m in members %}
+            <option value="{{ m.id }}"{% if m.id == member.id %} selected{% endif %}>{{ m.nickname }}</option>
+            {% endfor %}
+          </select>
+          <span class="settle-arrow-mini">→</span>
+          <select name="to_id" class="input-settle-to" id="settleTo">
+            {% for m in members %}
+            <option value="{{ m.id }}"{% if m.id != member.id %} selected{% endif %}>{{ m.nickname }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-row-inline">
+          <div class="amount-wrapper">
+            <span class="euro-sign">€</span>
+            <input type="number" name="amount" placeholder="0,00" step="0.01" min="0.01" required class="input-amount">
+          </div>
+        </div>
+        <div class="form-row">
+          <input type="text" name="note" placeholder="Note (es. contanti, bonifico...)" class="input-settle-note" maxlength="100">
+        </div>
+        <button type="submit" class="btn-primary">Registra pagamento 💸</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- M3: Settlement history -->
+  {% if settlement_history %}
+  <div class="section">
+    <div class="section-title">Pagamenti registrati</div>
+    {% for s in settlement_history %}
+    <div class="settle-pay-row" style="position:relative">
+      {% if member %}
+      <form method="POST" action="/g/{{ group_id }}/settle/{{ s.id }}" class="del-form" onsubmit="return confirm('Cancella questo pagamento?')">
+        <button type="submit" class="del-btn" title="Cancella pagamento">✕</button>
+      </form>
+      {% endif %}
+      <div class="settle-pay-info">
+        <div class="settle-pay-text">
+          <span style="color:var(--red-text)">{{ s.from_name }}</span> → <span style="color:var(--green-text)">{{ s.to_name }}</span>
+        </div>
+        {% if s.note %}<div class="settle-pay-note">📝 {{ s.note }}</div>{% endif %}
+        <div class="settle-pay-time">{{ s.created_at[:16].replace('T', ' ') if s.created_at else '' }}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+        <span class="settle-pay-amount">€ {{ fmt(s.amount) }}</span>
+        <span class="settle-pay-badge">✅ pagato</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
   {% endif %}
 
   <!-- Expenses list -->
